@@ -128,10 +128,35 @@ fn is_speakflow_process(name: &str) -> bool {
     n.contains("speakflow")
 }
 
-/// Cmd+V into whatever app is frontmost via Core Graphics (SpeakFlow's Accessibility grant).
-/// Posted on the **main thread** with `kCGSessionEventTap` — background `HID` posts often do nothing.
+/// Bring another app forward so Cmd+V goes to the right place (packaged builds often leave SpeakFlow frontmost).
 #[cfg(target_os = "macos")]
-fn paste_transcription(app: &tauri::AppHandle) {
+fn activate_app_by_name(name: &str) -> bool {
+    let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!(r#"tell application "{}" to activate"#, escaped);
+    match Command::new("osascript").arg("-e").arg(&script).output() {
+        Ok(o) if o.status.success() => {
+            eprintln!("[SpeakFlow] Activated target app: {}", name);
+            true
+        }
+        Ok(o) => {
+            eprintln!(
+                "[SpeakFlow] Could not activate \"{}\": {}",
+                name,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("[SpeakFlow] osascript failed: {}", e);
+            false
+        }
+    }
+}
+
+/// Cmd+V after transcription. Uses the app that was **frontmost when recording started** — not when
+/// transcription finished (release builds often focus SpeakFlow by then, which used to skip paste).
+#[cfg(target_os = "macos")]
+fn paste_transcription(app: &tauri::AppHandle, recording_started_in: Option<String>) {
     if !load_data().auto_paste.unwrap_or(true) {
         eprintln!("[SpeakFlow] Auto-paste off — text is on the clipboard only");
         return;
@@ -163,45 +188,53 @@ fn paste_transcription(app: &tauri::AppHandle) {
         v_up.post(tap);
     }
 
-    match get_frontmost_app_name() {
-        Some(ref n) if is_speakflow_process(n) => {
-            eprintln!("[SpeakFlow] Frontmost is SpeakFlow — skipping Cmd+V (text is on clipboard)");
+    // Onboarding / test: recording started with SpeakFlow focused — UI shows text; don't inject Cmd+V.
+    if let Some(ref t) = recording_started_in {
+        if is_speakflow_process(t) {
+            eprintln!("[SpeakFlow] Recording started in SpeakFlow — skipping injected Cmd+V");
+            return;
         }
-        Some(ref n) => {
-            eprintln!("[SpeakFlow] Pasting into frontmost app: {}", n);
-            std::thread::sleep(Duration::from_millis(100));
-            let (tx, rx) = mpsc::channel();
-            let app = app.clone();
-            if app
-                .run_on_main_thread(move || {
-                    simulate_cmd_v();
-                    let _ = tx.send(());
-                })
-                .is_ok()
-            {
-                let _ = rx.recv();
-            }
+    }
+
+    // Normal case: user was in Notes, Safari, etc. — re-activate that app, then paste.
+    if let Some(ref target) = recording_started_in {
+        let _ = activate_app_by_name(target);
+        std::thread::sleep(Duration::from_millis(220));
+        if get_frontmost_app_name()
+            .as_ref()
+            .map(|n| is_speakflow_process(n))
+            .unwrap_or(false)
+        {
+            eprintln!(
+                "[SpeakFlow] SpeakFlow still frontmost after activate — allow Automation for SpeakFlow if macOS asked, or paste manually (⌘V)."
+            );
+            return;
         }
-        None => {
-            eprintln!("[SpeakFlow] Could not detect frontmost app; attempting Cmd+V anyway");
-            std::thread::sleep(Duration::from_millis(100));
-            let (tx, rx) = mpsc::channel();
-            let app = app.clone();
-            if app
-                .run_on_main_thread(move || {
-                    simulate_cmd_v();
-                    let _ = tx.send(());
-                })
-                .is_ok()
-            {
-                let _ = rx.recv();
-            }
-        }
+    } else if get_frontmost_app_name()
+        .as_ref()
+        .map(|n| is_speakflow_process(n))
+        .unwrap_or(false)
+    {
+        eprintln!("[SpeakFlow] Frontmost is SpeakFlow and recording target unknown — skipping Cmd+V");
+        return;
+    }
+
+    std::thread::sleep(Duration::from_millis(100));
+    let (tx, rx) = mpsc::channel();
+    let app = app.clone();
+    if app
+        .run_on_main_thread(move || {
+            simulate_cmd_v();
+            let _ = tx.send(());
+        })
+        .is_ok()
+    {
+        let _ = rx.recv();
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn paste_transcription(_app: &tauri::AppHandle) {
+fn paste_transcription(_app: &tauri::AppHandle, _recording_started_in: Option<String>) {
     eprintln!("[SpeakFlow] Auto-paste after transcription is only implemented on macOS");
 }
 
@@ -237,11 +270,15 @@ fn handle_recording_toggle(app: &tauri::AppHandle) {
             return;
         };
         let sample_rate = config.sample_rate().0;
-        let channels = config.channels();
-        eprintln!("[SpeakFlow] Audio: {}Hz, {} ch", sample_rate, channels);
+        let channels = config.channels() as usize;
+        eprintln!(
+            "[SpeakFlow] Audio in: {}Hz, {} ch → WAV mono (Whisper-friendly)",
+            sample_rate, channels
+        );
 
+        // Mono WAV: whisper.cpp handles sample rate; stereo-as-interleaved was often mis-decoded → junk / "you".
         let spec = WavSpec {
-            channels,
+            channels: 1,
             sample_rate,
             bits_per_sample: 16,
             sample_format: SampleFormat::Int,
@@ -265,9 +302,28 @@ fn handle_recording_toggle(app: &tauri::AppHandle) {
             &config.into(),
             move |data: &[f32], _| {
                 if let Some(w) = writer_clone.lock().unwrap().as_mut() {
-                    for &sample in data {
-                        let s = (sample * i16::MAX as f32) as i16;
-                        w.write_sample(s).unwrap();
+                    let push = |w: &mut WavWriter<_>, v: f32| {
+                        let v = v.clamp(-1.0, 1.0);
+                        w.write_sample((v * i16::MAX as f32) as i16).unwrap();
+                    };
+                    match channels {
+                        1 => {
+                            for &sample in data {
+                                push(w, sample);
+                            }
+                        }
+                        2 => {
+                            for chunk in data.chunks_exact(2) {
+                                push(w, (chunk[0] + chunk[1]) * 0.5);
+                            }
+                        }
+                        n if n > 2 => {
+                            for frame in data.chunks_exact(n) {
+                                let m: f32 = frame.iter().copied().sum::<f32>() / n as f32;
+                                push(w, m);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             },
@@ -322,9 +378,44 @@ fn handle_recording_toggle(app: &tauri::AppHandle) {
             };
 
             let wav_path = std::env::temp_dir().join("speakflow_rec.wav");
-            eprintln!("[SpeakFlow] Running whisper on {:?}", wav_path);
+            let wav_meta = std::fs::metadata(&wav_path).ok().map(|m| m.len());
+            eprintln!(
+                "[SpeakFlow] WAV size: {:?} bytes — running whisper",
+                wav_meta
+            );
+
+            let out_stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let out_base = std::env::temp_dir().join(format!("speakflow_whisper_{}", out_stamp));
+            let out_txt = out_base.with_extension("txt");
+            let out_base_str = match out_base.to_str() {
+                Some(s) => s,
+                None => {
+                    eprintln!("[SpeakFlow] Bad temp path for whisper output");
+                    let _ = std::fs::remove_file(&wav_path);
+                    tray_idle();
+                    return;
+                }
+            };
+
             let output = Command::new(WHISPER_BIN)
-                .args(["-m", WHISPER_MODEL, "-f", wav_path.to_str().unwrap(), "-nt"])
+                .args([
+                    "-m",
+                    WHISPER_MODEL,
+                    "-f",
+                    wav_path.to_str().unwrap(),
+                    "-nt",
+                    "-np",
+                    "-otxt",
+                    "-of",
+                    out_base_str,
+                    "-l",
+                    "en",
+                    "-nth",
+                    "0.82",
+                ])
                 .output();
 
             let output = match output {
@@ -332,6 +423,7 @@ fn handle_recording_toggle(app: &tauri::AppHandle) {
                 Err(e) => {
                     eprintln!("[SpeakFlow] Whisper failed to run: {}", e);
                     let _ = std::fs::remove_file(&wav_path);
+                    let _ = std::fs::remove_file(&out_txt);
                     tray_idle();
                     return;
                 }
@@ -347,12 +439,14 @@ fn handle_recording_toggle(app: &tauri::AppHandle) {
                     "[SpeakFlow] stderr: {}",
                     String::from_utf8_lossy(&output.stderr)
                 );
+                let _ = std::fs::remove_file(&out_txt);
                 tray_idle();
                 return;
             }
 
-            let raw = String::from_utf8_lossy(&output.stdout);
-            let text = normalize_transcription(raw.as_ref());
+            let raw = std::fs::read_to_string(&out_txt).unwrap_or_default();
+            let _ = std::fs::remove_file(&out_txt);
+            let text = normalize_transcription(raw.trim());
             eprintln!("[SpeakFlow] Transcribed: \"{}\"", text);
 
             if text.is_empty() {
@@ -402,7 +496,7 @@ fn handle_recording_toggle(app: &tauri::AppHandle) {
                     paste_target
                 );
                 std::thread::sleep(Duration::from_millis(80));
-                paste_transcription(&app2);
+                paste_transcription(&app2, paste_target.clone());
             } else {
                 eprintln!("[SpeakFlow] Auto-paste off; clipboard only");
             }
