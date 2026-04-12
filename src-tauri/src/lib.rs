@@ -40,6 +40,9 @@ struct PersistData {
     history: Vec<HistoryEntry>,
     hotkey: Option<String>,
     onboarding_complete: Option<bool>,
+    /// When true (default), paste after transcription. When false, clipboard only.
+    #[serde(default)]
+    auto_paste: Option<bool>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone)]
@@ -73,6 +76,11 @@ fn save_data(data: &PersistData) {
     std::fs::write(path, serde_json::to_string(data).unwrap()).ok();
 }
 
+/// Trim ends and collapse whitespace / line breaks to single spaces (spoken text only).
+fn normalize_transcription(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(target_os = "macos")]
 fn get_frontmost_app_name() -> Option<String> {
     let output = Command::new("osascript")
@@ -96,6 +104,25 @@ fn get_frontmost_app_name() -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
+fn request_accessibility_if_needed() {
+    use core_foundation::base::TCFType;
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::string::CFString;
+
+    extern "C" {
+        fn AXIsProcessTrustedWithOptions(options: core_foundation::base::CFTypeRef) -> bool;
+    }
+
+    let key = CFString::new("AXTrustedCheckOptionPrompt");
+    let val = CFBoolean::true_value();
+    let dict = CFDictionary::from_CFType_pairs(&[(key.as_CFType(), val.as_CFType())]);
+
+    let trusted = unsafe { AXIsProcessTrustedWithOptions(dict.as_CFTypeRef()) };
+    eprintln!("[SpeakFlow] AXIsProcessTrusted (with prompt) = {}", trusted);
+}
+
+#[cfg(target_os = "macos")]
 fn is_speakflow_process(name: &str) -> bool {
     let n = name.to_lowercase();
     n.contains("speakflow")
@@ -105,6 +132,11 @@ fn is_speakflow_process(name: &str) -> bool {
 /// Posted on the **main thread** with `kCGSessionEventTap` — background `HID` posts often do nothing.
 #[cfg(target_os = "macos")]
 fn paste_transcription(app: &tauri::AppHandle) {
+    if !load_data().auto_paste.unwrap_or(true) {
+        eprintln!("[SpeakFlow] Auto-paste off — text is on the clipboard only");
+        return;
+    }
+
     fn simulate_cmd_v() {
         use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, KeyCode};
         use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
@@ -133,9 +165,7 @@ fn paste_transcription(app: &tauri::AppHandle) {
 
     match get_frontmost_app_name() {
         Some(ref n) if is_speakflow_process(n) => {
-            eprintln!(
-                "[SpeakFlow] Frontmost is SpeakFlow — skipping Cmd+V (text is on clipboard)"
-            );
+            eprintln!("[SpeakFlow] Frontmost is SpeakFlow — skipping Cmd+V (text is on clipboard)");
         }
         Some(ref n) => {
             eprintln!("[SpeakFlow] Pasting into frontmost app: {}", n);
@@ -192,8 +222,20 @@ fn handle_recording_toggle(app: &tauri::AppHandle) {
         tray.set_title(Some("REC")).ok();
 
         let host = cpal::default_host();
-        let device = host.default_input_device().expect("No input device found");
-        let config = device.default_input_config().expect("No input config");
+        let Some(device) = host.default_input_device() else {
+            eprintln!("[SpeakFlow] No input device");
+            s.recording = false;
+            s.recording_start = None;
+            tray.set_title(Some("IDLE")).ok();
+            return;
+        };
+        let Ok(config) = device.default_input_config() else {
+            eprintln!("[SpeakFlow] No input config");
+            s.recording = false;
+            s.recording_start = None;
+            tray.set_title(Some("IDLE")).ok();
+            return;
+        };
         let sample_rate = config.sample_rate().0;
         let channels = config.channels();
         eprintln!("[SpeakFlow] Audio: {}Hz, {} ch", sample_rate, channels);
@@ -206,27 +248,49 @@ fn handle_recording_toggle(app: &tauri::AppHandle) {
         };
 
         let wav_path = std::env::temp_dir().join("speakflow_rec.wav");
-        let writer = WavWriter::create(&wav_path, spec).expect("Failed to create WAV");
+        let writer = match WavWriter::create(&wav_path, spec) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("[SpeakFlow] Failed to create WAV: {}", e);
+                s.recording = false;
+                s.recording_start = None;
+                tray.set_title(Some("IDLE")).ok();
+                return;
+            }
+        };
         let writer = Arc::new(Mutex::new(Some(writer)));
         let writer_clone = writer.clone();
 
-        let stream = device
-            .build_input_stream(
-                &config.into(),
-                move |data: &[f32], _| {
-                    if let Some(w) = writer_clone.lock().unwrap().as_mut() {
-                        for &sample in data {
-                            let s = (sample * i16::MAX as f32) as i16;
-                            w.write_sample(s).unwrap();
-                        }
+        let stream = match device.build_input_stream(
+            &config.into(),
+            move |data: &[f32], _| {
+                if let Some(w) = writer_clone.lock().unwrap().as_mut() {
+                    for &sample in data {
+                        let s = (sample * i16::MAX as f32) as i16;
+                        w.write_sample(s).unwrap();
                     }
-                },
-                |e| eprintln!("[SpeakFlow] Stream error: {}", e),
-                None,
-            )
-            .expect("Failed to build input stream");
+                }
+            },
+            |e| eprintln!("[SpeakFlow] Stream error: {}", e),
+            None,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[SpeakFlow] Failed to build input stream: {}", e);
+                s.recording = false;
+                s.recording_start = None;
+                tray.set_title(Some("IDLE")).ok();
+                return;
+            }
+        };
 
-        stream.play().expect("Failed to start recording");
+        if let Err(e) = stream.play() {
+            eprintln!("[SpeakFlow] Failed to start recording: {}", e);
+            s.recording = false;
+            s.recording_start = None;
+            tray.set_title(Some("IDLE")).ok();
+            return;
+        }
         s.stream = Some(Box::new(stream));
         s.writer = Some(writer);
     } else {
@@ -251,6 +315,12 @@ fn handle_recording_toggle(app: &tauri::AppHandle) {
         let paste_target = s.last_front_app.take();
 
         std::thread::spawn(move || {
+            let tray_idle = || {
+                if let Some(tray) = app2.tray_by_id(TRAY_ID) {
+                    tray.set_title(Some("IDLE")).ok();
+                }
+            };
+
             let wav_path = std::env::temp_dir().join("speakflow_rec.wav");
             eprintln!("[SpeakFlow] Running whisper on {:?}", wav_path);
             let output = Command::new(WHISPER_BIN)
@@ -262,28 +332,47 @@ fn handle_recording_toggle(app: &tauri::AppHandle) {
                 Err(e) => {
                     eprintln!("[SpeakFlow] Whisper failed to run: {}", e);
                     let _ = std::fs::remove_file(&wav_path);
-                    if let Some(tray) = app2.tray_by_id(TRAY_ID) {
-                        tray.set_title(Some("IDLE")).ok();
-                    }
+                    tray_idle();
                     return;
                 }
             };
 
-            if let Err(e) = std::fs::remove_file(&wav_path) {
+            let _ = std::fs::remove_file(&wav_path).map_err(|e| {
                 eprintln!("[SpeakFlow] Could not remove temp wav: {}", e);
-            }
+            });
 
             if !output.status.success() {
                 eprintln!("[SpeakFlow] Whisper exited with: {}", output.status);
-                eprintln!("[SpeakFlow] stderr: {}", String::from_utf8_lossy(&output.stderr));
+                eprintln!(
+                    "[SpeakFlow] stderr: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                tray_idle();
+                return;
             }
 
-            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let raw = String::from_utf8_lossy(&output.stdout);
+            let text = normalize_transcription(raw.as_ref());
             eprintln!("[SpeakFlow] Transcribed: \"{}\"", text);
+
+            if text.is_empty() {
+                eprintln!("[SpeakFlow] Empty transcription after normalization; skipping save");
+                tray_idle();
+                return;
+            }
+
+            if elapsed > 300 {
+                eprintln!(
+                    "[SpeakFlow] Long recording ({}s); transcription may take a while",
+                    elapsed
+                );
+            }
+
             let words = text.split_whitespace().count();
             let timestamp = chrono::Utc::now().to_rfc3339();
 
             let mut d = load_data();
+            let auto_paste = d.auto_paste.unwrap_or(true);
             d.words += words;
             d.sessions += 1;
             d.seconds += elapsed;
@@ -298,27 +387,27 @@ fn handle_recording_toggle(app: &tauri::AppHandle) {
 
             let _ = app2.emit("transcription-result", text.clone());
 
-            if !text.is_empty() {
-                match arboard::Clipboard::new() {
-                    Ok(mut clipboard) => {
-                        if let Err(e) = clipboard.set_text(&text) {
-                            eprintln!("[SpeakFlow] Clipboard error: {}", e);
-                        }
+            match arboard::Clipboard::new() {
+                Ok(mut clipboard) => {
+                    if let Err(e) = clipboard.set_text(&text) {
+                        eprintln!("[SpeakFlow] Clipboard error: {}", e);
                     }
-                    Err(e) => eprintln!("[SpeakFlow] Clipboard init error: {}", e),
                 }
+                Err(e) => eprintln!("[SpeakFlow] Clipboard init error: {}", e),
+            }
 
+            if auto_paste {
                 eprintln!(
                     "[SpeakFlow] Pasting (record started in: {:?})",
                     paste_target
                 );
                 std::thread::sleep(Duration::from_millis(80));
                 paste_transcription(&app2);
+            } else {
+                eprintln!("[SpeakFlow] Auto-paste off; clipboard only");
             }
 
-            if let Some(tray) = app2.tray_by_id(TRAY_ID) {
-                tray.set_title(Some("IDLE")).ok();
-            }
+            tray_idle();
         });
     }
 }
@@ -397,6 +486,18 @@ fn complete_onboarding() {
 #[tauri::command]
 fn has_configured_hotkey() -> bool {
     load_data().hotkey.is_some()
+}
+
+#[tauri::command]
+fn get_auto_paste() -> bool {
+    load_data().auto_paste.unwrap_or(true)
+}
+
+#[tauri::command]
+fn set_auto_paste(enabled: bool) {
+    let mut d = load_data();
+    d.auto_paste = Some(enabled);
+    save_data(&d);
 }
 
 #[tauri::command]
@@ -483,9 +584,17 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            let saved_hotkey = load_data().hotkey.unwrap_or_else(|| "Alt+Space".to_string());
+            #[cfg(target_os = "macos")]
+            request_accessibility_if_needed();
+
+            let saved_hotkey = load_data()
+                .hotkey
+                .unwrap_or_else(|| "Alt+Space".to_string());
             if let Err(e) = setup_recording_shortcut(app.handle(), &saved_hotkey) {
-                eprintln!("[SpeakFlow] Failed to register hotkey '{}': {}", saved_hotkey, e);
+                eprintln!(
+                    "[SpeakFlow] Failed to register hotkey '{}': {}",
+                    saved_hotkey, e
+                );
                 let mut d = load_data();
                 d.hotkey = None;
                 d.onboarding_complete = Some(false);
@@ -504,7 +613,9 @@ pub fn run() {
             has_configured_hotkey,
             unregister_hotkeys,
             register_hotkey,
-            restart_app
+            restart_app,
+            get_auto_paste,
+            set_auto_paste
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

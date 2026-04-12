@@ -4,10 +4,11 @@ version = 4
 
 [[package]]
 name = "SpeakFlow"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "arboard",
  "chrono",
+ "core-foundation",
  "core-graphics",
  "cpal",
  "hound",

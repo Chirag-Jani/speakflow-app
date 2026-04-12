@@ -159,13 +159,21 @@ export default function App() {
   /** After saving hotkey: onboarding → test, main settings → main */
   const [hotkeyReturnTo, setHotkeyReturnTo] = useState<"test" | "main">("test");
   const [hotkeyError, setHotkeyError] = useState("");
+  /** Default true: auto-paste after dictation */
+  const [autoPaste, setAutoPaste] = useState(true);
   const hotkeyCaptureRef = useRef<HTMLDivElement>(null);
+
+  const isMac =
+    typeof navigator !== "undefined" &&
+    /Mac|iPhone|iPad|iPod/.test(navigator.userAgent);
 
   useEffect(() => {
     (async () => {
       const done = await invoke<boolean>("get_onboarding_complete");
       const saved = await invoke<string>("get_saved_hotkey");
       const hasHotkey = await invoke<boolean>("has_configured_hotkey");
+      const ap = await invoke<boolean>("get_auto_paste");
+      setAutoPaste(ap);
       setHotkey(saved);
       setDisplayHotkey(formatDisplay(saved));
       if (done) setScreen("main");
@@ -217,6 +225,8 @@ export default function App() {
     const load = async () => {
       const s = await invoke<Stats>("get_stats");
       const h = await invoke<Session[]>("get_history");
+      const ap = await invoke<boolean>("get_auto_paste");
+      setAutoPaste(ap);
       setStats(s);
       setHistory(h);
     };
@@ -377,6 +387,23 @@ export default function App() {
             <br />
             No cloud. No subscription. Just speak.
           </div>
+          {isMac ? (
+            <div
+              style={{
+                marginTop: 14,
+                fontSize: 12,
+                color: "#444",
+                lineHeight: 1.55,
+                maxWidth: 320,
+              }}
+            >
+              On macOS, SpeakFlow may ask for{" "}
+              <strong style={{ color: "#666" }}>Accessibility</strong> so it
+              can paste into other apps. If paste doesn’t work, enable
+              SpeakFlow (and your terminal or Cursor, if you run from there) in
+              System Settings → Privacy & Security → Accessibility.
+            </div>
+          ) : null}
         </div>
         <button
           onClick={() => {
@@ -419,6 +446,21 @@ export default function App() {
         <div style={{ fontSize: 13, color: "#555", textAlign: "center" }}>
           Press the key combination you want to use to start and stop recording.
         </div>
+        {isMac ? (
+          <div
+            style={{
+              fontSize: 11,
+              color: "#444",
+              textAlign: "center",
+              maxWidth: 320,
+              lineHeight: 1.5,
+            }}
+          >
+            Accessibility lets the app paste text where your cursor is. Allow
+            the prompt, or add SpeakFlow under System Settings → Privacy &
+            Security → Accessibility.
+          </div>
+        ) : null}
         <div
           ref={hotkeyCaptureRef}
           tabIndex={0}
@@ -521,6 +563,21 @@ export default function App() {
           <br />
           Press it again to stop.
         </div>
+        {isMac ? (
+          <div
+            style={{
+              fontSize: 11,
+              color: "#444",
+              textAlign: "center",
+              maxWidth: 320,
+              lineHeight: 1.5,
+            }}
+          >
+            If nothing appears in the other app, confirm Accessibility is on
+            for SpeakFlow (and for Terminal or Cursor if you launched from
+            there).
+          </div>
+        ) : null}
         <div
           style={{
             width: "100%",
@@ -699,6 +756,51 @@ export default function App() {
             {wpm} / 200 wpm
           </span>
         </div>
+        <label
+          style={{
+            display: "flex",
+            alignItems: "flex-start",
+            gap: 10,
+            marginTop: 14,
+            cursor: "pointer",
+            userSelect: "none",
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={autoPaste}
+            onChange={async (e) => {
+              const v = e.target.checked;
+              setAutoPaste(v);
+              try {
+                await invoke("set_auto_paste", { enabled: v });
+              } catch (err) {
+                console.error(err);
+                setAutoPaste(!v);
+              }
+            }}
+            style={{ accentColor: "#a855f7", marginTop: 2 }}
+          />
+          <span>
+            <span
+              style={{ fontSize: 12, color: "#888", display: "block" }}
+            >
+              Auto-paste after dictation
+            </span>
+            <span
+              style={{
+                fontSize: 10,
+                color: "#333",
+                display: "block",
+                marginTop: 4,
+                lineHeight: 1.4,
+              }}
+            >
+              When off, text is copied to the clipboard only (no automatic
+              paste). Default is on.
+            </span>
+          </span>
+        </label>
       </div>
 
       <div

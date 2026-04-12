@@ -1,7 +1,7 @@
 {
   "productName": "SpeakFlow",
-  "version": "0.1.0",
-  "identifier": "com.speakflow.app",
+  "version": "1.0.0",
+  "identifier": "com.speakflow.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -24,7 +24,11 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
-    "icon": ["icons/icon.icns", "icons/icon.ico", "icons/icon.png"]
+    "targets": "dmg",
+    "icon": ["icons/icon.icns", "icons/icon.ico", "icons/icon.png"],
+    "macOS": {
+      "entitlements": "entitlements.plist",
+      "signingIdentity": "-"
+    }
   }
 }
