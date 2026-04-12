@@ -11,9 +11,11 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "SpeakFlow",
         "width": 420,
         "height": 680,
+        "visible": true,
         "resizable": false,
         "decorations": true,
         "backgroundColor": "#0c0c0c"
