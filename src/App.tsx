@@ -161,6 +161,7 @@ export default function App() {
   const [hotkeyError, setHotkeyError] = useState("");
   /** Default true: auto-paste after dictation */
   const [autoPaste, setAutoPaste] = useState(true);
+  const [accessibilityEnabled, setAccessibilityEnabled] = useState(true);
   const hotkeyCaptureRef = useRef<HTMLDivElement>(null);
 
   const isMac =
@@ -173,7 +174,9 @@ export default function App() {
       const saved = await invoke<string>("get_saved_hotkey");
       const hasHotkey = await invoke<boolean>("has_configured_hotkey");
       const ap = await invoke<boolean>("get_auto_paste");
+      const ax = await invoke<boolean>("is_accessibility_enabled");
       setAutoPaste(ap);
+      setAccessibilityEnabled(ax);
       setHotkey(saved);
       setDisplayHotkey(formatDisplay(saved));
       if (done) setScreen("main");
@@ -226,7 +229,9 @@ export default function App() {
       const s = await invoke<Stats>("get_stats");
       const h = await invoke<Session[]>("get_history");
       const ap = await invoke<boolean>("get_auto_paste");
+      const ax = await invoke<boolean>("is_accessibility_enabled");
       setAutoPaste(ap);
+      setAccessibilityEnabled(ax);
       setStats(s);
       setHistory(h);
     };
@@ -774,6 +779,13 @@ export default function App() {
               setAutoPaste(v);
               try {
                 await invoke("set_auto_paste", { enabled: v });
+                if (v) {
+                  const ax = await invoke<boolean>("is_accessibility_enabled");
+                  setAccessibilityEnabled(ax);
+                  if (!ax) {
+                    await invoke("open_accessibility_settings_command");
+                  }
+                }
               } catch (err) {
                 console.error(err);
                 setAutoPaste(!v);
@@ -801,6 +813,49 @@ export default function App() {
             </span>
           </span>
         </label>
+        {autoPaste && !accessibilityEnabled ? (
+          <div
+            style={{
+              marginTop: 10,
+              border: "0.5px solid #3a2a0a",
+              background: "#1a1408",
+              borderRadius: 8,
+              padding: "9px 10px",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 10,
+            }}
+          >
+            <span style={{ fontSize: 11, color: "#c9a75b", lineHeight: 1.4 }}>
+              Enable Accessibility for SpeakFlow to allow auto-paste.
+            </span>
+            <button
+              type="button"
+              onClick={async () => {
+                try {
+                  await invoke("open_accessibility_settings_command");
+                  const ax = await invoke<boolean>("is_accessibility_enabled");
+                  setAccessibilityEnabled(ax);
+                } catch (err) {
+                  console.error(err);
+                }
+              }}
+              style={{
+                padding: "5px 10px",
+                borderRadius: 7,
+                border: "0.5px solid #5a4720",
+                background: "#2a200f",
+                color: "#d9bd7a",
+                fontSize: 11,
+                cursor: "pointer",
+                whiteSpace: "nowrap",
+              }}
+            >
+              Open Settings
+            </button>
+          </div>
+        ) : null}
       </div>
 
       <div

@@ -14,6 +14,10 @@ const WHISPER_BIN: &str =
     "/Users/chiragjani/Documents/me/temp/wisp/whisper.cpp/build/bin/whisper-cli";
 const WHISPER_MODEL: &str =
     "/Users/chiragjani/Documents/me/temp/wisp/whisper.cpp/models/ggml-base.en.bin";
+#[cfg(target_os = "macos")]
+const BIN_LSAPPINFO: &str = "/usr/bin/lsappinfo";
+#[cfg(target_os = "macos")]
+const BIN_OPEN: &str = "/usr/bin/open";
 const TRAY_ID: &str = "speakflow-tray";
 
 #[derive(serde::Serialize, Clone)]
@@ -81,21 +85,57 @@ fn normalize_transcription(raw: &str) -> String {
     raw.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Get the frontmost app name using lsappinfo (no Automation permission needed).
 #[cfg(target_os = "macos")]
 fn get_frontmost_app_name() -> Option<String> {
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(
-            r#"tell application "System Events" to get name of first application process whose frontmost is true"#,
-        )
-        .output()
-        .ok()?;
-    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
+    let asn_out = match Command::new(BIN_LSAPPINFO).arg("front").output() {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("[SpeakFlow] lsappinfo front failed: {}", e);
+            return None;
+        }
+    };
+    if !asn_out.status.success() {
+        eprintln!(
+            "[SpeakFlow] lsappinfo front stderr: {}",
+            String::from_utf8_lossy(&asn_out.stderr).trim()
+        );
+        return None;
     }
+    let asn = String::from_utf8_lossy(&asn_out.stdout).trim().to_string();
+    if asn.is_empty() {
+        return None;
+    }
+    let info_out = match Command::new(BIN_LSAPPINFO)
+        .args(["info", "-only", "name", &asn])
+        .output()
+    {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("[SpeakFlow] lsappinfo info failed: {}", e);
+            return None;
+        }
+    };
+    if !info_out.status.success() {
+        eprintln!(
+            "[SpeakFlow] lsappinfo info stderr: {}",
+            String::from_utf8_lossy(&info_out.stderr).trim()
+        );
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&info_out.stdout);
+    // lsappinfo outputs: "LSDisplayName"="AppName"
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(idx) = line.find('=') {
+            let val = line[idx + 1..].trim().trim_matches('"').to_string();
+            if !val.is_empty() {
+                eprintln!("[SpeakFlow] lsappinfo frontmost: {}", val);
+                return Some(val);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -123,119 +163,158 @@ fn request_accessibility_if_needed() {
 }
 
 #[cfg(target_os = "macos")]
+fn is_accessibility_trusted() -> bool {
+    extern "C" {
+        fn AXIsProcessTrusted() -> bool;
+    }
+    unsafe { AXIsProcessTrusted() }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_accessibility_trusted() -> bool {
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn open_accessibility_settings() {
+    let _ = Command::new(BIN_OPEN)
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+        .output();
+}
+
+#[cfg(target_os = "macos")]
 fn is_speakflow_process(name: &str) -> bool {
     let n = name.to_lowercase();
     n.contains("speakflow")
 }
 
-/// Bring another app forward so Cmd+V goes to the right place (packaged builds often leave SpeakFlow frontmost).
+/// Bring the named app to the front using `open -a` (no Automation permission needed).
 #[cfg(target_os = "macos")]
-fn activate_app_by_name(name: &str) -> bool {
-    let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
-    let script = format!(r#"tell application "{}" to activate"#, escaped);
-    match Command::new("osascript").arg("-e").arg(&script).output() {
+fn activate_app(name: &str) -> bool {
+    match Command::new(BIN_OPEN).args(["-a", name]).output() {
         Ok(o) if o.status.success() => {
-            eprintln!("[SpeakFlow] Activated target app: {}", name);
+            eprintln!("[SpeakFlow] Activated '{}' via open -a", name);
             true
         }
         Ok(o) => {
             eprintln!(
-                "[SpeakFlow] Could not activate \"{}\": {}",
+                "[SpeakFlow] open -a '{}' failed: {}",
                 name,
                 String::from_utf8_lossy(&o.stderr).trim()
             );
             false
         }
         Err(e) => {
-            eprintln!("[SpeakFlow] osascript failed: {}", e);
+            eprintln!("[SpeakFlow] open -a failed: {}", e);
             false
         }
     }
 }
 
-/// Cmd+V after transcription. Uses the app that was **frontmost when recording started** — not when
-/// transcription finished (release builds often focus SpeakFlow by then, which used to skip paste).
+/// Simulate Cmd+V using CGEvent (only needs Accessibility permission, NOT Automation).
 #[cfg(target_os = "macos")]
-fn paste_transcription(app: &tauri::AppHandle, recording_started_in: Option<String>) {
+fn simulate_cmd_v() {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventCreateKeyboardEvent(
+            source: *const std::ffi::c_void,
+            virtual_key: u16,
+            key_down: bool,
+        ) -> *mut std::ffi::c_void;
+        fn CGEventSetFlags(event: *mut std::ffi::c_void, flags: u64);
+        fn CGEventPost(tap: u32, event: *mut std::ffi::c_void);
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFRelease(cf: *mut std::ffi::c_void);
+    }
+
+    const HID_EVENT_TAP: u32 = 0;
+    const FLAG_CMD: u64 = 1 << 20;
+    const VK_CMD: u16 = 55;
+    const VK_V: u16 = 9;
+
+    unsafe {
+        let cmd_down = CGEventCreateKeyboardEvent(std::ptr::null(), VK_CMD, true);
+        let v_down = CGEventCreateKeyboardEvent(std::ptr::null(), VK_V, true);
+        let v_up = CGEventCreateKeyboardEvent(std::ptr::null(), VK_V, false);
+        let cmd_up = CGEventCreateKeyboardEvent(std::ptr::null(), VK_CMD, false);
+
+        if cmd_down.is_null() || v_down.is_null() || v_up.is_null() || cmd_up.is_null() {
+            eprintln!("[SpeakFlow] CGEventCreateKeyboardEvent failed");
+            if !cmd_down.is_null() {
+                CFRelease(cmd_down);
+            }
+            if !v_down.is_null() {
+                CFRelease(v_down);
+            }
+            if !v_up.is_null() {
+                CFRelease(v_up);
+            }
+            if !cmd_up.is_null() {
+                CFRelease(cmd_up);
+            }
+            return;
+        }
+
+        // Explicit modifier sequence is more reliable across apps than only setting flags on V.
+        CGEventSetFlags(cmd_down, FLAG_CMD);
+        CGEventPost(HID_EVENT_TAP, cmd_down);
+        std::thread::sleep(Duration::from_millis(10));
+
+        CGEventSetFlags(v_down, FLAG_CMD);
+        CGEventPost(HID_EVENT_TAP, v_down);
+        std::thread::sleep(Duration::from_millis(10));
+
+        CGEventSetFlags(v_up, FLAG_CMD);
+        CGEventPost(HID_EVENT_TAP, v_up);
+        std::thread::sleep(Duration::from_millis(10));
+
+        CGEventSetFlags(cmd_up, 0);
+        CGEventPost(HID_EVENT_TAP, cmd_up);
+
+        CFRelease(cmd_down);
+        CFRelease(v_down);
+        CFRelease(v_up);
+        CFRelease(cmd_up);
+    }
+    eprintln!("[SpeakFlow] Sent Cmd+V via CGEvent");
+}
+
+#[cfg(target_os = "macos")]
+fn paste_transcription(_app: &tauri::AppHandle, recording_started_in: Option<String>) {
     if !load_data().auto_paste.unwrap_or(true) {
         eprintln!("[SpeakFlow] Auto-paste off — text is on the clipboard only");
         return;
     }
 
-    fn simulate_cmd_v() {
-        use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, KeyCode};
-        use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-
-        let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
-            eprintln!("[SpeakFlow] CGEventSource failed");
-            return;
-        };
-
-        let tap = CGEventTapLocation::Session;
-
-        let Ok(v_down) = CGEvent::new_keyboard_event(source.clone(), KeyCode::ANSI_V, true) else {
-            eprintln!("[SpeakFlow] CGEvent (V down) failed");
-            return;
-        };
-        v_down.set_flags(CGEventFlags::CGEventFlagCommand);
-        v_down.post(tap);
-
-        let Ok(v_up) = CGEvent::new_keyboard_event(source, KeyCode::ANSI_V, false) else {
-            eprintln!("[SpeakFlow] CGEvent (V up) failed");
-            return;
-        };
-        v_up.set_flags(CGEventFlags::CGEventFlagCommand);
-        v_up.post(tap);
-    }
-
-    // Onboarding / test: recording started with SpeakFlow focused — UI shows text; don't inject Cmd+V.
-    if let Some(ref t) = recording_started_in {
-        if is_speakflow_process(t) {
-            eprintln!("[SpeakFlow] Recording started in SpeakFlow — skipping injected Cmd+V");
-            return;
-        }
-    }
-
-    // Normal case: user was in Notes, Safari, etc. — re-activate that app, then paste.
-    if let Some(ref target) = recording_started_in {
-        let _ = activate_app_by_name(target);
-        std::thread::sleep(Duration::from_millis(220));
-        if get_frontmost_app_name()
-            .as_ref()
-            .map(|n| is_speakflow_process(n))
-            .unwrap_or(false)
-        {
-            eprintln!(
-                "[SpeakFlow] SpeakFlow still frontmost after activate — allow Automation for SpeakFlow if macOS asked, or paste manually (⌘V)."
-            );
-            return;
-        }
-    } else if get_frontmost_app_name()
-        .as_ref()
-        .map(|n| is_speakflow_process(n))
-        .unwrap_or(false)
-    {
-        eprintln!("[SpeakFlow] Frontmost is SpeakFlow and recording target unknown — skipping Cmd+V");
+    if !is_accessibility_trusted() {
+        eprintln!("[SpeakFlow] Accessibility permission missing; prompting user");
+        request_accessibility_if_needed();
+        open_accessibility_settings();
         return;
     }
 
-    std::thread::sleep(Duration::from_millis(100));
-    let (tx, rx) = mpsc::channel();
-    let app = app.clone();
-    if app
-        .run_on_main_thread(move || {
-            simulate_cmd_v();
-            let _ = tx.send(());
-        })
-        .is_ok()
-    {
-        let _ = rx.recv();
+    if let Some(ref t) = recording_started_in {
+        if is_speakflow_process(t) {
+            eprintln!("[SpeakFlow] Recording started in SpeakFlow — skipping paste");
+            return;
+        }
     }
+
+    if let Some(ref target) = recording_started_in {
+        eprintln!("[SpeakFlow] Activating target app: {}", target);
+        activate_app(target);
+        std::thread::sleep(Duration::from_millis(350));
+    }
+
+    eprintln!("[SpeakFlow] Sending Cmd+V");
+    simulate_cmd_v();
 }
 
 #[cfg(not(target_os = "macos"))]
 fn paste_transcription(_app: &tauri::AppHandle, _recording_started_in: Option<String>) {
-    eprintln!("[SpeakFlow] Auto-paste after transcription is only implemented on macOS");
+    eprintln!("[SpeakFlow] Auto-paste is only implemented on macOS");
 }
 
 fn handle_recording_toggle(app: &tauri::AppHandle) {
@@ -481,22 +560,57 @@ fn handle_recording_toggle(app: &tauri::AppHandle) {
 
             let _ = app2.emit("transcription-result", text.clone());
 
-            match arboard::Clipboard::new() {
-                Ok(mut clipboard) => {
-                    if let Err(e) = clipboard.set_text(&text) {
-                        eprintln!("[SpeakFlow] Clipboard error: {}", e);
+            // NSPasteboard must be updated on the main thread; setting from the Whisper worker
+            // can fail or apply late, so ⌘V pastes *stale* clipboard (e.g. old "you") while the UI
+            // still shows the new string from the event above.
+            let text_for_clip = text.clone();
+            let app_clip = app2.clone();
+            let (tx_clip, rx_clip) = mpsc::channel();
+            if app_clip
+                .run_on_main_thread(move || {
+                    match arboard::Clipboard::new() {
+                        Ok(mut clipboard) => {
+                            if let Err(e) = clipboard.set_text(&text_for_clip) {
+                                eprintln!("[SpeakFlow] Clipboard error: {}", e);
+                            } else {
+                                eprintln!(
+                                    "[SpeakFlow] Clipboard set on main thread ({} chars)",
+                                    text_for_clip.chars().count()
+                                );
+                            }
+                        }
+                        Err(e) => eprintln!("[SpeakFlow] Clipboard init error: {}", e),
                     }
-                }
-                Err(e) => eprintln!("[SpeakFlow] Clipboard init error: {}", e),
+                    let _ = tx_clip.send(());
+                })
+                .is_ok()
+            {
+                let _ = rx_clip.recv();
+            } else {
+                eprintln!("[SpeakFlow] Could not run clipboard update on main thread");
             }
+            // Let the pasteboard commit before we activate another app and send ⌘V.
+            std::thread::sleep(Duration::from_millis(220));
 
             if auto_paste {
                 eprintln!(
                     "[SpeakFlow] Pasting (record started in: {:?})",
                     paste_target
                 );
-                std::thread::sleep(Duration::from_millis(80));
-                paste_transcription(&app2, paste_target.clone());
+                let app_for_paste = app2.clone();
+                let paste_target_for_main = paste_target.clone();
+                let (tx_paste, rx_paste) = mpsc::channel();
+                if app2
+                    .run_on_main_thread(move || {
+                        paste_transcription(&app_for_paste, paste_target_for_main);
+                        let _ = tx_paste.send(());
+                    })
+                    .is_ok()
+                {
+                    let _ = rx_paste.recv();
+                } else {
+                    eprintln!("[SpeakFlow] Could not run paste on main thread");
+                }
             } else {
                 eprintln!("[SpeakFlow] Auto-paste off; clipboard only");
             }
@@ -592,6 +706,17 @@ fn set_auto_paste(enabled: bool) {
     let mut d = load_data();
     d.auto_paste = Some(enabled);
     save_data(&d);
+}
+
+#[tauri::command]
+fn is_accessibility_enabled() -> bool {
+    is_accessibility_trusted()
+}
+
+#[tauri::command]
+fn open_accessibility_settings_command() {
+    #[cfg(target_os = "macos")]
+    open_accessibility_settings();
 }
 
 #[tauri::command]
@@ -709,7 +834,9 @@ pub fn run() {
             register_hotkey,
             restart_app,
             get_auto_paste,
-            set_auto_paste
+            set_auto_paste,
+            is_accessibility_enabled,
+            open_accessibility_settings_command
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
